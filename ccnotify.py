@@ -14,6 +14,10 @@ from logging.handlers import TimedRotatingFileHandler
 from datetime import datetime
 
 
+# Set to True to suppress notifications when VS Code is already focused on the same workspace.
+SUPPRESS_IF_VSCODE_FOCUSED = True
+
+
 class ClaudePromptTracker:
     def __init__(self):
         """Initialize the prompt tracker with database setup"""
@@ -246,7 +250,7 @@ class ClaudePromptTracker:
             subtitle=subtitle,
             cwd=cwd,
         )
-        logging.info(f"Permission request notification sent for {tool_name}")
+        logging.info(f"Permission request handled for {tool_name}")
 
     def calculate_duration_from_db(self, record_id):
         """Calculate duration for a completed record"""
@@ -321,6 +325,72 @@ class ClaudePromptTracker:
             return True
         return False
 
+    def is_vscode_focused_on_workspace(self, workspace_path):
+        """Return True if VS Code is the frontmost app and showing this workspace.
+
+        Uses lsappinfo (no osascript) for the frontmost-app check, then reads
+        ~/Library/.../workspaceStorage/*/workspace.json to find the storage dir
+        for our path, and compares state.vscdb mod-times to identify the active window.
+        """
+        # Step 1: is VS Code the frontmost app?
+        try:
+            out = subprocess.run(
+                ["lsappinfo", "list"],
+                capture_output=True, text=True, timeout=3,
+            ).stdout
+            if not any('"Code"' in line and "(in front)" in line for line in out.splitlines()):
+                return False
+        except Exception as e:
+            logging.debug(f"lsappinfo error: {e}")
+            return False
+
+        # Step 2: find this workspace's storage directory via workspace.json
+        ws_storage = os.path.expanduser(
+            "~/Library/Application Support/Code/User/workspaceStorage"
+        )
+        target_uri = f"file://{workspace_path}".rstrip("/")
+        target_db = None
+
+        try:
+            for entry in os.scandir(ws_storage):
+                if not entry.is_dir():
+                    continue
+                wj = os.path.join(entry.path, "workspace.json")
+                if not os.path.isfile(wj):
+                    continue
+                try:
+                    with open(wj) as f:
+                        folder = json.load(f).get("folder", "").rstrip("/")
+                    if folder == target_uri:
+                        target_db = os.path.join(entry.path, "state.vscdb")
+                        break
+                except Exception:
+                    continue
+        except Exception as e:
+            logging.debug(f"Workspace scan error: {e}")
+            return False
+
+        if not target_db or not os.path.exists(target_db):
+            # Workspace not found in VS Code's storage — can't confirm it's active
+            return False
+
+        # Step 3: is this workspace's state DB the most recently modified?
+        # The active window writes its DB most recently; background windows write less often.
+        target_mtime = os.path.getmtime(target_db)
+        try:
+            for entry in os.scandir(ws_storage):
+                if not entry.is_dir():
+                    continue
+                other_db = os.path.join(entry.path, "state.vscdb")
+                if other_db == target_db:
+                    continue
+                if os.path.isfile(other_db) and os.path.getmtime(other_db) > target_mtime:
+                    return False  # A different workspace was more recently active
+        except Exception as e:
+            logging.debug(f"Workspace mtime comparison error: {e}")
+
+        return True
+
     def find_workspace_root(self, path):
         """Walk up from path to find the git root; fall back to path itself."""
         current = os.path.abspath(path)
@@ -340,6 +410,14 @@ class ClaudePromptTracker:
         if self.is_temp_path(cwd):
             logging.info(f"Notification suppressed for temp path: {cwd}")
             return
+
+        if SUPPRESS_IF_VSCODE_FOCUSED and cwd:
+            workspace = self.find_workspace_root(cwd)
+            if self.is_vscode_focused_on_workspace(workspace):
+                logging.info(
+                    f"Notification suppressed: VS Code focused on {workspace}"
+                )
+                return
 
         current_time = datetime.now().strftime("%B %d, %Y at %H:%M")
 

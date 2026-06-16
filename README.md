@@ -13,6 +13,7 @@ Starting from claude-code v1.0.95 (2025-08-31), any invalid settings in `~/.clau
 - 🔔 **Get notified** when Claude requires your input or completes a task.
 - 🔗 **Click to jump back** when notifications are clicked, automatically taking you to the corresponding project in VS Code.
 - ⏱️ **Task Duration**: Displays started time, and how long the task took to complete
+- 🔕 **Focus-aware**: Suppresses notifications when VS Code is already focused on the same workspace
 
 **Note**: Currently compatible with macOS only.
 
@@ -169,6 +170,18 @@ Contributed via [PR #11](https://github.com/dazuiba/CCNotify/pull/11): the `Noti
 ### Current time in notifications
 
 Each notification subtitle includes a human-readable timestamp (`June 16, 2026 at 14:35`) so you can tell at a glance how long ago an event fired.
+
+### Suppress notifications when VS Code is already focused on the workspace
+
+**Problem:** When you are actively working in the VS Code window where Claude is running, desktop notifications are noise — you can see Claude's output directly.
+
+**Fix:** Before firing a notification, CCNotify checks whether VS Code is the frontmost application *and* its active window is the same workspace the notification targets. If so, the notification is silently suppressed. The check is done entirely without AppleScript:
+
+1. `lsappinfo list` identifies the frontmost application by its bundle ID (`com.microsoft.VSCode`).
+2. `~/Library/Application Support/Code/User/workspaceStorage/*/workspace.json` maps each storage directory to a folder URI, locating the storage entry for the current workspace.
+3. The `state.vscdb` modification time of that entry is compared against all other open workspace storage directories — the frontmost VS Code window writes to its database most recently.
+
+To disable this behaviour, set `SUPPRESS_IF_VSCODE_FOCUSED = False` near the top of `ccnotify.py`.
 
 ---
 
