@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Claude Code Notify
-https://github.com/dazuiba/CCNotify
+https://github.com/bsibsi/CCNotify
 """
 
 import os
@@ -141,8 +141,9 @@ class ClaudePromptTracker:
                 seq = seq_row[0] if seq_row else 1
 
                 duration = self.calculate_duration_from_db(record_id)
+                workspace = self.find_workspace_root(cwd) if cwd else cwd
                 self.send_notification(
-                    title=os.path.basename(cwd) if cwd else "Claude Task",
+                    title=os.path.basename(workspace) if workspace else "Claude Task",
                     subtitle=f"job#{seq} done, duration: {duration}",
                     cwd=cwd,
                 )
@@ -205,8 +206,9 @@ class ClaudePromptTracker:
 
         # Send notification only if should_notify is True
         if should_notify:
+            workspace = self.find_workspace_root(cwd) if cwd else cwd
             self.send_notification(
-                title=os.path.basename(cwd) if cwd else "Claude Task",
+                title=os.path.basename(workspace) if workspace else "Claude Task",
                 subtitle=subtitle,
                 cwd=cwd,
             )
@@ -215,6 +217,36 @@ class ClaudePromptTracker:
             logging.info(
                 f"Notification suppressed for session {session_id}: {subtitle}"
             )
+
+    def handle_permission_request(self, data):
+        """Handle PermissionRequest event - notify user that Claude is asking for permission"""
+        session_id = data.get("session_id")
+        tool_name = data.get("tool_name", "Unknown tool")
+        tool_input = data.get("tool_input", {})
+        cwd = data.get("cwd", "")
+
+        # Build a brief description of what the tool wants to do
+        detail = None
+        if tool_name == "Bash" and "command" in tool_input:
+            cmd = tool_input["command"]
+            detail = cmd[:80] + ("…" if len(cmd) > 80 else "")
+        elif tool_name in ("Write", "Edit", "Read") and "file_path" in tool_input:
+            detail = tool_input["file_path"]
+        elif "path" in tool_input:
+            detail = tool_input["path"]
+
+        subtitle = f"Permission Required: {tool_name}"
+        logging.info(
+            f"[PERMISSION_REQUEST] session={session_id}, tool={tool_name}, detail={detail}"
+        )
+
+        workspace = self.find_workspace_root(cwd) if cwd else cwd
+        self.send_notification(
+            title=os.path.basename(workspace) if workspace else "Claude Task",
+            subtitle=subtitle,
+            cwd=cwd,
+        )
+        logging.info(f"Permission request notification sent for {tool_name}")
 
     def calculate_duration_from_db(self, record_id):
         """Calculate duration for a completed record"""
@@ -270,9 +302,44 @@ class ClaudePromptTracker:
             logging.error(f"Error calculating duration: {e}")
             return "Unknown"
 
+    def is_temp_path(self, path):
+        """Return True if path is a system or macOS temp directory."""
+        if not path:
+            return False
+        resolved = os.path.realpath(os.path.abspath(path))
+        # /tmp and /private/tmp (macOS symlink pair)
+        if resolved.startswith("/tmp") or resolved.startswith("/private/tmp"):
+            return True
+        # macOS per-user temp: /var/folders/*/*/T/...
+        if resolved.startswith("/var/folders/"):
+            parts = resolved.split(os.sep)
+            if "T" in parts:
+                return True
+        # Any path component literally named "tmp" (case-insensitive)
+        parts = resolved.split(os.sep)
+        if any(p.lower() == "tmp" for p in parts):
+            return True
+        return False
+
+    def find_workspace_root(self, path):
+        """Walk up from path to find the git root; fall back to path itself."""
+        current = os.path.abspath(path)
+        while True:
+            if os.path.isdir(os.path.join(current, ".git")):
+                return current
+            parent = os.path.dirname(current)
+            if parent == current:
+                break
+            current = parent
+        return path
+
     def send_notification(self, title, subtitle, cwd=None):
         """Send macOS notification using terminal-notifier"""
         from datetime import datetime
+
+        if self.is_temp_path(cwd):
+            logging.info(f"Notification suppressed for temp path: {cwd}")
+            return
 
         current_time = datetime.now().strftime("%B %d, %Y at %H:%M")
 
@@ -288,7 +355,8 @@ class ClaudePromptTracker:
             ]
 
             if cwd:
-                cmd.extend(["-execute", f'/usr/local/bin/code "{cwd}"'])
+                workspace = self.find_workspace_root(cwd)
+                cmd.extend(["-execute", f'open -a "Visual Studio Code" "{workspace}"'])
 
             subprocess.run(cmd, check=False, capture_output=True)
             logging.info(f"Notification sent: {title} - {subtitle}")
@@ -304,6 +372,7 @@ def validate_input_data(data, expected_event_name):
         "UserPromptSubmit": ["session_id", "prompt", "cwd", "hook_event_name"],
         "Stop": ["session_id", "hook_event_name"],
         "Notification": ["session_id", "message", "hook_event_name"],
+        "PermissionRequest": ["session_id", "tool_name", "hook_event_name"],
     }
 
     if expected_event_name not in required_fields:
@@ -338,7 +407,7 @@ def main():
             return
 
         expected_event_name = sys.argv[1]
-        valid_events = ["UserPromptSubmit", "Stop", "Notification"]
+        valid_events = ["UserPromptSubmit", "Stop", "Notification", "PermissionRequest"]
 
         if expected_event_name not in valid_events:
             logging.error(f"Invalid hook type: {expected_event_name}")
@@ -364,6 +433,8 @@ def main():
             tracker.handle_stop(data)
         elif expected_event_name == "Notification":
             tracker.handle_notification(data)
+        elif expected_event_name == "PermissionRequest":
+            tracker.handle_permission_request(data)
 
     except json.JSONDecodeError as e:
         logging.error(f"JSON decode error: {e}")

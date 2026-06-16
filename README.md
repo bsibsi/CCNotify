@@ -2,6 +2,8 @@
 
 # CCNotify
 
+> **This is a fork of [dazuiba/CCNotify](https://github.com/dazuiba/CCNotify)** with several behaviour fixes and quality-of-life improvements described in [Fork enhancements](#fork-enhancements).
+
 CCNotify provides desktop notifications for Claude Code, alerting you when Claude needs your input or completes tasks.
 ## Important Notes
 Starting from claude-code v1.0.95 (2025-08-31), any invalid settings in `~/.claude/settings.json` will disable hooks. See [Why not working](#why-not-working) for solutions.
@@ -48,40 +50,50 @@ Add the following hooks to your Claude configuration to enable ccnotify:
  ~/.claude/settings.json 
  
 ```json
-
+{
   "hooks": {
-  "UserPromptSubmit": [
-    {
-      "hooks": [
-        {
-          "type": "command",
-          "command": "~/.claude/ccnotify/ccnotify.py UserPromptSubmit"
-        }
-      ]
-    }
-  ],
-  "Stop": [
-    {
-      "hooks": [
-        {
-          "type": "command",
-          "command": "~/.claude/ccnotify/ccnotify.py Stop"
-        }
-      ]
-    }
-  ],
-  "Notification": [
-    {
-      "hooks": [
-        {
-          "type": "command",
-          "command": "~/.claude/ccnotify/ccnotify.py Notification"
-        }
-      ]
-    }
-  ]
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "~/.claude/ccnotify/ccnotify.py UserPromptSubmit"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "~/.claude/ccnotify/ccnotify.py Stop"
+          }
+        ]
+      }
+    ],
+    "Notification": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "~/.claude/ccnotify/ccnotify.py Notification"
+          }
+        ]
+      }
+    ],
+    "PermissionRequest": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "~/.claude/ccnotify/ccnotify.py PermissionRequest"
+          }
+        ]
+      }
+    ]
+  }
 }
-
 ```
 
 ## Try It Out
@@ -126,6 +138,39 @@ ccnotify tracks Claude sessions and provides notifications at key moments:
 
 All activity is logged to `~/.claude/ccnotify/ccnotify.log` and session data is stored in `~/.claude/ccnotify/ccnotify.db` locally. No data is uploaded or shared externally.
 
+
+## Fork enhancements
+
+The following improvements are present in this fork but not in the upstream repository.
+
+### Click notification opens the correct VS Code workspace
+
+**Problem:** Claude Code sometimes navigates into a subfolder while working (e.g. to read a nested file). When a notification fires with that subfolder as `cwd`, clicking it runs `code "<subfolder>"` which opens a new VS Code workspace for the subfolder instead of focusing the already-open project window.
+
+**Fix:** Before opening VS Code, CCNotify now walks up the directory tree from `cwd` to find the nearest `.git` root and opens that path instead. If no git root exists the original path is used as a fallback. VS Code is opened via macOS `open -a "Visual Studio Code"` rather than a hard-coded `code` binary path, which works regardless of how VS Code was installed.
+
+### Suppress notifications for temporary directories
+
+**Problem:** When Claude Code operates on files in system or macOS temp directories (`/tmp`, `/private/tmp`, `/var/folders/…/T/…`), spurious notifications are fired for work the user never cares about.
+
+**Fix:** Notifications are silently suppressed when `cwd` resolves to a recognised temp location:
+- `/tmp` and `/private/tmp` (standard Unix temp and its macOS `realpath`)
+- `/var/folders/*/*/T/…` (macOS per-user sandbox temp, used by `NSTemporaryDirectory()`)
+- Any path whose components include a directory named `tmp` (case-insensitive)
+
+### Enhanced notification type detection
+
+Contributed via [PR #11](https://github.com/dazuiba/CCNotify/pull/11): the `Notification` hook handler now recognises a wider range of Claude messages — permission requests, approval prompts, and generic notifications — and labels each one with an appropriate subtitle ("Permission Required", "Action Required", etc.).
+
+### Log rotation
+
+`ccnotify.log` is rotated daily and the last 7 days of logs are kept, preventing unbounded disk growth.
+
+### Current time in notifications
+
+Each notification subtitle includes a human-readable timestamp (`June 16, 2026 at 14:35`) so you can tell at a glance how long ago an event fired.
+
+---
 
 ## Uninstall
 
