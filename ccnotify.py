@@ -314,8 +314,8 @@ class ClaudePromptTracker:
         # /tmp and /private/tmp (macOS symlink pair)
         if resolved.startswith("/tmp") or resolved.startswith("/private/tmp"):
             return True
-        # macOS per-user temp: /var/folders/*/*/T/...
-        if resolved.startswith("/var/folders/"):
+        # macOS per-user temp: /var/folders/*/*/T/... (realpath resolves /var -> /private/var)
+        if resolved.startswith("/var/folders/") or resolved.startswith("/private/var/folders/"):
             parts = resolved.split(os.sep)
             if "T" in parts:
                 return True
