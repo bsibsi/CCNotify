@@ -43,6 +43,13 @@ ccnotify uses `terminal-notifier` for macOS notifications. Install it using Home
 brew install terminal-notifier
 ```
 
+**Supported versions:** tested against `terminal-notifier` 3.1.0, and expected to work on the rest of the 3.x line and on 2.x. Version 3 rebuilt the tool on Apple's `UserNotifications` framework and, notably, removed `-appIcon` — macOS no longer allows any app to override a notification's own icon badge. ccnotify approximates a source-app icon (e.g. VS Code) using `-contentImage` instead, which attaches it as an image inside the notification body rather than replacing the badge. Run `~/.claude/ccnotify/ccnotify.py test` after installing to confirm your version works end-to-end (see [Try It Out](#try-it-out)).
+
+**Known issue after a fresh install or a Homebrew upgrade to 3.x:** `terminal-notifier -diagnose` may report `authorization: not requested yet` and every notification fails with `Could not request notification permission: Notifications are not allowed for this application`, with no permission dialog ever appearing — see [upstream issue #330](https://github.com/julienXX/terminal-notifier/issues/330). This traces back to the unnotarized, ad-hoc-signed Homebrew bottle not registering cleanly with LaunchServices/`usernoted` on first use. In our case it resolved on its own after repeatedly launching the bundle directly and re-running `-diagnose` over about an hour, with no configuration change. If you hit this:
+1. Force-launch the bundle once to register it: `open -n "$(dirname "$(readlink -f "$(which terminal-notifier)")")/../terminal-notifier.app"` (or find the path with `brew --prefix terminal-notifier`).
+2. Re-run `~/.claude/ccnotify/ccnotify.py test` and `terminal-notifier -diagnose` a few times, with a pause in between — the actual authorization registration appears to lag behind the first request rather than happening instantly.
+3. Once `-diagnose` reports `authorization: authorized`, check System Settings → Notifications → terminal-notifier has an alert style set (Banners or Alerts), which `-diagnose` flags separately if missing.
+
 For alternative installation methods and more information, visit: https://github.com/julienXX/terminal-notifier
 
 ### 3. Configure Claude Hooks
@@ -99,7 +106,21 @@ Add the following hooks to your Claude configuration to enable ccnotify:
 
 ## Try It Out
 
-To verify the notification system works, start a new Claude Code session and run:
+The fastest way to check the whole pipeline (terminal-notifier found, permission granted, icon attached) is the built-in test command:
+
+```bash
+~/.claude/ccnotify/ccnotify.py test
+```
+
+It bypasses the usual suppression rules (temp paths, VS Code focus) and fires a real notification immediately, printing which `terminal-notifier` binary/version it used and whether delivery succeeded. Pass a directory as an extra argument to test the "click to jump to VS Code" behavior against a specific workspace:
+
+```bash
+~/.claude/ccnotify/ccnotify.py test ~/path/to/project
+```
+
+If it reports failure, check `~/.claude/ccnotify/ccnotify.log` or run `terminal-notifier -diagnose` for the reason (most commonly: notification permission was never granted or was reset — macOS asks the first time a given binary sends one).
+
+Alternatively, to verify it end-to-end through an actual Claude Code session, start one and run:
 ```
 after 1 second, echo 'hello'
 ```
@@ -182,6 +203,22 @@ Each notification subtitle includes a human-readable timestamp (`June 16, 2026 a
 3. The `state.vscdb` modification time of that entry is compared against all other open workspace storage directories — the frontmost VS Code window writes to its database most recently.
 
 To disable this behaviour, set `SUPPRESS_IF_VSCODE_FOCUSED = False` near the top of `ccnotify.py`.
+
+### Alternative notification backend: alerter
+
+CCNotify can deliver notifications through [alerter](https://github.com/vjeantet/alerter) instead of `terminal-notifier`. It supports a real `--app-icon` override (an actual icon badge, not just an attached content image) — useful if you'd rather have that than chase `terminal-notifier`'s occasional first-run [permission bug](#why-not-working).
+
+**How the icon (and the zero-setup permission) actually works, and why that matters:** alerter delivers through `NSUserNotification`, the *deprecated* (since macOS 11) notification API terminal-notifier itself had to abandon, and sets the icon via `setValue(_:forKey:"_identityImage")` — an undocumented, private property, not a supported API. Separately, its `--sender` option (defaulting to `com.apple.Terminal`) works by method-swizzling `NSBundle`'s `bundleIdentifier` at runtime (see `Sources/BundleHook/BundleIdentifierHook.m`) so the OS believes the notification request is coming from Terminal.app — which already has permission — rather than from alerter itself. That's why it needed no permission dance at all: it isn't really requesting permission as itself. These are real notifications, not a fake overlay, but every part of what makes them nicer rests on a deprecated framework, a private KVC key, and runtime identity spoofing — any of which Apple could break in a future macOS update with no warning, and it also means the notification's identity (its settings-gear destination, its Focus/Do-Not-Disturb rules) belongs to whatever `--sender` you're impersonating, not to CCNotify or alerter.
+
+This comes with further trade-offs, which is why it's off by default:
+- **No click-to-reopen-VS-Code.** alerter has no equivalent to `-execute`, so clicking the notification does nothing.
+- **Delivery isn't confirmed.** alerter blocks until a notification is dismissed or clicked — even for a plain message — which doesn't fit a hook that must return quickly. CCNotify launches it detached and never waits on it, so it only knows the process started, not that anything was actually shown. By default it stays on screen indefinitely until you dismiss or click it (`ALERTER_TIMEOUT_SECONDS = 0` in `ccnotify.py`, matching alerter's own default); set it to a number of seconds if you'd rather old, un-interacted-with alerts auto-close and their background process exit sooner.
+
+To switch to it:
+```bash
+brew install vjeantet/tap/alerter
+```
+then set `NOTIFICATION_BACKEND = "alerter"` near the top of `ccnotify.py`. Run `~/.claude/ccnotify/ccnotify.py test` afterward to confirm it works — the test command reports which backend is active and calls out these limitations directly.
 
 ---
 

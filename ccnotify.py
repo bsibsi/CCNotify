@@ -18,6 +18,22 @@ from datetime import datetime
 # Set to True to suppress notifications when VS Code is already focused on the same workspace.
 SUPPRESS_IF_VSCODE_FOCUSED = True
 
+# Which CLI tool delivers notifications: "terminal-notifier" (default) or "alerter"
+# (https://github.com/vjeantet/alerter). alerter is code-signed and notarized, unlike
+# terminal-notifier, and supports a real -app-icon override instead of the -contentImage
+# workaround below — but it has no equivalent to -execute, so switching to it drops
+# click-notification-to-reopen-VS-Code, and it blocks until the notification is
+# dismissed/clicked, so we fire it detached and never confirm delivery synchronously.
+NOTIFICATION_BACKEND = "terminal-notifier"
+
+# How long a detached alerter notification stays on screen waiting for a
+# dismiss/click before it auto-closes. 0 (the default, matching alerter's
+# own default) means it lingers indefinitely until you interact with it or
+# it's cleared some other way. Since CCNotify never waits on the process
+# either way, raising this only bounds how long the idle background process
+# sticks around — it has no effect on hook latency.
+ALERTER_TIMEOUT_SECONDS = 0
+
 # Common install locations, used when this hook's inherited PATH doesn't include
 # terminal-notifier (e.g. when VS Code fails to resolve the user's shell environment
 # and falls back to launchd's bare PATH for the extension host and its subprocesses).
@@ -25,6 +41,12 @@ _TERMINAL_NOTIFIER_FALLBACK_PATHS = [
     "/opt/homebrew/bin/terminal-notifier",
     "/usr/local/bin/terminal-notifier",
     "/opt/local/bin/terminal-notifier",
+]
+
+_ALERTER_FALLBACK_PATHS = [
+    "/opt/homebrew/bin/alerter",
+    "/usr/local/bin/alerter",
+    "/opt/local/bin/alerter",
 ]
 
 
@@ -37,6 +59,62 @@ def resolve_terminal_notifier():
         if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
             return candidate
     return None
+
+
+def resolve_alerter():
+    """Find alerter via PATH, falling back to common install locations."""
+    found = shutil.which("alerter")
+    if found:
+        return found
+    for candidate in _ALERTER_FALLBACK_PATHS:
+        if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            return candidate
+    return None
+
+
+# terminal-notifier 3.x has no way to override a notification's own icon badge
+# (macOS removed -appIcon; the icon always comes from the sending app's bundle).
+# The closest approximation is -contentImage, which attaches a picture inside
+# the notification body. We convert each source app's .icns to PNG on first
+# use (contentImage only accepts formats macOS can attach) and cache it.
+_ICON_CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "icons")
+
+_SOURCE_APP_ICNS = {
+    "vscode": "/Applications/Visual Studio Code.app/Contents/Resources/Code.icns",
+}
+
+
+def detect_source_app():
+    """Best-effort guess at what launched Claude Code, from inherited env vars."""
+    if (
+        os.environ.get("CLAUDE_CODE_ENTRYPOINT") == "claude-vscode"
+        or os.environ.get("__CFBundleIdentifier") == "com.microsoft.VSCode"
+    ):
+        return "vscode"
+    return None
+
+
+def resolve_source_app_icon(source_app):
+    """Return a cached PNG path for the source app's icon, converting its .icns on first use."""
+    icns_path = _SOURCE_APP_ICNS.get(source_app)
+    if not icns_path or not os.path.isfile(icns_path):
+        return None
+
+    cached_png = os.path.join(_ICON_CACHE_DIR, f"{source_app}.png")
+    if os.path.isfile(cached_png):
+        return cached_png
+
+    try:
+        os.makedirs(_ICON_CACHE_DIR, exist_ok=True)
+        subprocess.run(
+            ["sips", "-s", "format", "png", icns_path, "--out", cached_png],
+            check=True,
+            capture_output=True,
+        )
+        return cached_png if os.path.isfile(cached_png) else None
+    except Exception as e:
+        logging.debug(f"Icon conversion failed for {source_app}: {e}")
+        return None
 
 
 class ClaudePromptTracker:
@@ -424,28 +502,44 @@ class ClaudePromptTracker:
             current = parent
         return path
 
-    def send_notification(self, title, subtitle, cwd=None):
-        """Send macOS notification using terminal-notifier"""
+    def send_notification(self, title, subtitle, cwd=None, force=False):
+        """Send a macOS notification via the configured NOTIFICATION_BACKEND.
+
+        Returns True if the notification was (or is believed to have been)
+        delivered, False otherwise (including when suppressed or skipped).
+        `force=True` bypasses the temp-path and VS-Code-focus suppression
+        checks, used by the `test` subcommand to exercise the real send path.
+        """
         from datetime import datetime
 
-        if self.is_temp_path(cwd):
-            logging.info(f"Notification suppressed for temp path: {cwd}")
-            return
+        if not force:
+            if self.is_temp_path(cwd):
+                logging.info(f"Notification suppressed for temp path: {cwd}")
+                return False
 
-        if SUPPRESS_IF_VSCODE_FOCUSED and cwd:
-            workspace = self.find_workspace_root(cwd)
-            if self.is_vscode_focused_on_workspace(workspace):
-                logging.info(
-                    f"Notification suppressed: VS Code focused on {workspace}"
-                )
-                return
+            if SUPPRESS_IF_VSCODE_FOCUSED and cwd:
+                workspace = self.find_workspace_root(cwd)
+                if self.is_vscode_focused_on_workspace(workspace):
+                    logging.info(
+                        f"Notification suppressed: VS Code focused on {workspace}"
+                    )
+                    return False
 
         current_time = datetime.now().strftime("%B %d, %Y at %H:%M")
+        icon_path = resolve_source_app_icon(detect_source_app())
 
+        if NOTIFICATION_BACKEND == "alerter":
+            return self._send_via_alerter(title, subtitle, current_time, icon_path)
+        return self._send_via_terminal_notifier(
+            title, subtitle, current_time, icon_path, cwd
+        )
+
+    def _send_via_terminal_notifier(self, title, subtitle, current_time, icon_path, cwd):
+        """Send via terminal-notifier: fire-and-forget, with click-to-reopen-VS-Code."""
         notifier = resolve_terminal_notifier()
         if not notifier:
             logging.warning("terminal-notifier not found, notification skipped")
-            return
+            return False
 
         try:
             cmd = [
@@ -455,19 +549,83 @@ class ClaudePromptTracker:
                 "-title",
                 title,
                 "-subtitle",
-                f"{subtitle}\n{current_time}",
+                subtitle,
+                "-message",
+                current_time,
             ]
+
+            if icon_path:
+                cmd.extend(["-contentImage", icon_path])
 
             if cwd:
                 workspace = self.find_workspace_root(cwd)
                 cmd.extend(["-execute", f'open -a "Visual Studio Code" "{workspace}"'])
 
-            subprocess.run(cmd, check=False, capture_output=True)
+            result = subprocess.run(cmd, check=False, capture_output=True, text=True)
+            if result.returncode != 0:
+                logging.error(
+                    f"terminal-notifier exited {result.returncode}: "
+                    f"{result.stderr.strip() or result.stdout.strip()}"
+                )
+                return False
+
             logging.info(f"Notification sent: {title} - {subtitle}")
+            return True
         except FileNotFoundError:
             logging.warning("terminal-notifier not found, notification skipped")
+            return False
         except Exception as e:
             logging.error(f"Error sending notification: {e}")
+            return False
+
+    def _send_via_alerter(self, title, subtitle, current_time, icon_path):
+        """Send via alerter (https://github.com/vjeantet/alerter).
+
+        alerter blocks until the notification is dismissed or clicked (even
+        for a plain message, with no -actions), which does not fit a hook
+        that must return quickly. So we launch it detached and never wait on
+        it — we only know it was launched, not that it was actually
+        delivered, and there is no click-to-reopen-VS-Code support here since
+        alerter has no -execute equivalent. ALERTER_TIMEOUT_SECONDS bounds
+        how long each detached process lingers if never interacted with.
+        """
+        alerter = resolve_alerter()
+        if not alerter:
+            logging.warning("alerter not found, notification skipped")
+            return False
+
+        try:
+            cmd = [
+                alerter,
+                "--sound",
+                "default",
+                "--title",
+                title,
+                "--subtitle",
+                subtitle,
+                "--message",
+                current_time,
+                "--timeout",
+                str(ALERTER_TIMEOUT_SECONDS),
+            ]
+
+            if icon_path:
+                cmd.extend(["--app-icon", icon_path])
+
+            subprocess.Popen(
+                cmd,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            logging.info(f"Notification launched via alerter: {title} - {subtitle}")
+            return True
+        except FileNotFoundError:
+            logging.warning("alerter not found, notification skipped")
+            return False
+        except Exception as e:
+            logging.error(f"Error sending notification via alerter: {e}")
+            return False
 
 
 def validate_input_data(data, expected_event_name):
@@ -502,6 +660,65 @@ def validate_input_data(data, expected_event_name):
     return True
 
 
+def run_test_notification():
+    """Fire a real notification straight through the configured backend,
+    bypassing suppression rules, so the user can quickly confirm the whole
+    pipeline (binary found, permission granted, icon attached) actually works."""
+    print(f"Notification backend: {NOTIFICATION_BACKEND}")
+
+    if NOTIFICATION_BACKEND == "alerter":
+        binary = resolve_alerter()
+        binary_name = "alerter"
+        install_hint = "brew install vjeantet/tap/alerter"
+        version_flag = "--version"
+    else:
+        binary = resolve_terminal_notifier()
+        binary_name = "terminal-notifier"
+        install_hint = "brew install terminal-notifier"
+        version_flag = "-version"
+
+    if not binary:
+        print(f"FAILED: {binary_name} not found on PATH or common install locations.")
+        print(f"Install it with: {install_hint}")
+        sys.exit(1)
+
+    version = subprocess.run(
+        [binary, version_flag], capture_output=True, text=True, check=False
+    ).stdout.strip()
+    print(f"Using {binary_name}: {binary} ({version or 'version unknown'})")
+
+    source_app = detect_source_app()
+    print(f"Detected source app: {source_app or 'none (generic)'}")
+
+    if NOTIFICATION_BACKEND == "alerter":
+        print(
+            "Note: the alerter backend is fire-and-forget — this only confirms the "
+            "process launched, not that the notification was actually delivered, "
+            "and it does not support click-to-reopen-VS-Code."
+        )
+
+    test_cwd = sys.argv[2] if len(sys.argv) > 2 else os.getcwd()
+
+    tracker = ClaudePromptTracker()
+    ok = tracker.send_notification(
+        title="CCNotify Test",
+        subtitle="If you can see this, notifications are working",
+        cwd=test_cwd,
+        force=True,
+    )
+
+    if ok:
+        print("Notification sent — check your screen (and Notification Center if you missed it).")
+    else:
+        print("FAILED to send notification. Check ccnotify.log for details", end="")
+        if NOTIFICATION_BACKEND == "alerter":
+            print(".")
+        else:
+            print(", or run:")
+            print("  terminal-notifier -diagnose")
+        sys.exit(1)
+
+
 def main():
     """Main entry point - read JSON from stdin and process event"""
     try:
@@ -511,6 +728,11 @@ def main():
             return
 
         expected_event_name = sys.argv[1]
+
+        if expected_event_name == "test":
+            run_test_notification()
+            return
+
         valid_events = ["UserPromptSubmit", "Stop", "Notification", "PermissionRequest"]
 
         if expected_event_name not in valid_events:
