@@ -7,6 +7,7 @@ https://github.com/bsibsi/CCNotify
 import os
 import sys
 import json
+import shutil
 import sqlite3
 import subprocess
 import logging
@@ -16,6 +17,26 @@ from datetime import datetime
 
 # Set to True to suppress notifications when VS Code is already focused on the same workspace.
 SUPPRESS_IF_VSCODE_FOCUSED = True
+
+# Common install locations, used when this hook's inherited PATH doesn't include
+# terminal-notifier (e.g. when VS Code fails to resolve the user's shell environment
+# and falls back to launchd's bare PATH for the extension host and its subprocesses).
+_TERMINAL_NOTIFIER_FALLBACK_PATHS = [
+    "/opt/homebrew/bin/terminal-notifier",
+    "/usr/local/bin/terminal-notifier",
+    "/opt/local/bin/terminal-notifier",
+]
+
+
+def resolve_terminal_notifier():
+    """Find terminal-notifier via PATH, falling back to common install locations."""
+    found = shutil.which("terminal-notifier")
+    if found:
+        return found
+    for candidate in _TERMINAL_NOTIFIER_FALLBACK_PATHS:
+        if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            return candidate
+    return None
 
 
 class ClaudePromptTracker:
@@ -421,9 +442,14 @@ class ClaudePromptTracker:
 
         current_time = datetime.now().strftime("%B %d, %Y at %H:%M")
 
+        notifier = resolve_terminal_notifier()
+        if not notifier:
+            logging.warning("terminal-notifier not found, notification skipped")
+            return
+
         try:
             cmd = [
-                "terminal-notifier",
+                notifier,
                 "-sound",
                 "default",
                 "-title",
