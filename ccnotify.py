@@ -5,6 +5,7 @@ https://github.com/bsibsi/CCNotify
 """
 
 import os
+import re
 import sys
 import json
 import shutil
@@ -244,11 +245,13 @@ class ClaudePromptTracker:
                 seq = seq_row[0] if seq_row else 1
 
                 duration = self.calculate_duration_from_db(record_id)
-                workspace = self.find_workspace_root(cwd) if cwd else cwd
+                transcript_path = data.get("transcript_path")
+                workspace = self.resolve_workspace(cwd, transcript_path)
                 self.send_notification(
                     title=os.path.basename(workspace) if workspace else "Claude Task",
                     subtitle=f"job#{seq} done, duration: {duration}",
                     cwd=cwd,
+                    transcript_path=transcript_path,
                 )
 
                 logging.info(
@@ -309,11 +312,12 @@ class ClaudePromptTracker:
 
         # Send notification only if should_notify is True
         if should_notify:
-            workspace = self.find_workspace_root(cwd) if cwd else cwd
+            workspace = self.resolve_workspace(cwd, data.get("transcript_path"))
             self.send_notification(
                 title=os.path.basename(workspace) if workspace else "Claude Task",
                 subtitle=subtitle,
                 cwd=cwd,
+                transcript_path=data.get("transcript_path"),
             )
             logging.info(f"Notification sent for session {session_id}: {subtitle}")
         else:
@@ -343,11 +347,12 @@ class ClaudePromptTracker:
             f"[PERMISSION_REQUEST] session={session_id}, tool={tool_name}, detail={detail}"
         )
 
-        workspace = self.find_workspace_root(cwd) if cwd else cwd
+        workspace = self.resolve_workspace(cwd, data.get("transcript_path"))
         self.send_notification(
             title=os.path.basename(workspace) if workspace else "Claude Task",
             subtitle=subtitle,
             cwd=cwd,
+            transcript_path=data.get("transcript_path"),
         )
         logging.info(f"Permission request handled for {tool_name}")
 
@@ -502,7 +507,59 @@ class ClaudePromptTracker:
             current = parent
         return path
 
-    def send_notification(self, title, subtitle, cwd=None, force=False):
+    def known_vscode_workspaces(self):
+        """Local folders VS Code has opened, from workspaceStorage/*/workspace.json."""
+        from urllib.parse import unquote, urlparse
+
+        ws_storage = os.path.expanduser(
+            "~/Library/Application Support/Code/User/workspaceStorage"
+        )
+        folders = []
+        try:
+            for entry in os.scandir(ws_storage):
+                wj = os.path.join(entry.path, "workspace.json")
+                try:
+                    with open(wj) as f:
+                        uri = json.load(f).get("folder", "")
+                except Exception:
+                    continue
+                if uri.startswith("file://"):
+                    folders.append(unquote(urlparse(uri).path).rstrip("/"))
+        except Exception as e:
+            logging.debug(f"Workspace scan error: {e}")
+        return folders
+
+    def resolve_workspace(self, cwd, transcript_path=None):
+        """Resolve the VS Code workspace folder that contains cwd.
+
+        Claude's cwd drifts into subfolders when it runs `cd`, so rather than
+        guessing from .git, match against the folders VS Code actually has open:
+        1. candidates = known VS Code workspaces that are cwd or an ancestor of it
+        2. prefer those that also contain the session's launch directory (encoded
+           in transcript_path's project dir, which does not change on `cd`)
+        3. pick the deepest; fall back to the git-root walk if none match.
+        """
+        if not cwd:
+            return cwd
+        real_cwd = os.path.abspath(cwd)
+        candidates = [
+            w for w in self.known_vscode_workspaces()
+            if w and (real_cwd == w or real_cwd.startswith(w + os.sep))
+        ]
+        if not candidates:
+            return self.find_workspace_root(cwd)
+
+        if transcript_path:
+            launch = os.path.basename(os.path.dirname(transcript_path))
+            anchored = []
+            for w in candidates:
+                enc = re.sub(r"[^A-Za-z0-9]", "-", w)
+                if launch == enc or launch.startswith(enc + "-"):
+                    anchored.append(w)
+            candidates = anchored or candidates
+        return max(candidates, key=len)
+
+    def send_notification(self, title, subtitle, cwd=None, force=False, transcript_path=None):
         """Send a macOS notification via the configured NOTIFICATION_BACKEND.
 
         Returns True if the notification was (or is believed to have been)
@@ -518,7 +575,7 @@ class ClaudePromptTracker:
                 return False
 
             if SUPPRESS_IF_VSCODE_FOCUSED and cwd:
-                workspace = self.find_workspace_root(cwd)
+                workspace = self.resolve_workspace(cwd, transcript_path)
                 if self.is_vscode_focused_on_workspace(workspace):
                     logging.info(
                         f"Notification suppressed: VS Code focused on {workspace}"
@@ -531,10 +588,11 @@ class ClaudePromptTracker:
         if NOTIFICATION_BACKEND == "alerter":
             return self._send_via_alerter(title, subtitle, current_time, icon_path)
         return self._send_via_terminal_notifier(
-            title, subtitle, current_time, icon_path, cwd
+            title, subtitle, current_time, icon_path,
+            self.resolve_workspace(cwd, transcript_path) if cwd else None,
         )
 
-    def _send_via_terminal_notifier(self, title, subtitle, current_time, icon_path, cwd):
+    def _send_via_terminal_notifier(self, title, subtitle, current_time, icon_path, workspace):
         """Send via terminal-notifier: fire-and-forget, with click-to-reopen-VS-Code."""
         notifier = resolve_terminal_notifier()
         if not notifier:
@@ -557,8 +615,7 @@ class ClaudePromptTracker:
             if icon_path:
                 cmd.extend(["-contentImage", icon_path])
 
-            if cwd:
-                workspace = self.find_workspace_root(cwd)
+            if workspace:
                 cmd.extend(["-execute", f'open -a "Visual Studio Code" "{workspace}"'])
 
             result = subprocess.run(cmd, check=False, capture_output=True, text=True)
