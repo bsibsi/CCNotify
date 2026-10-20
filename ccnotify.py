@@ -448,50 +448,22 @@ class ClaudePromptTracker:
             logging.debug(f"lsappinfo error: {e}")
             return False
 
-        # Step 2: find this workspace's storage directory via workspace.json
-        ws_storage = os.path.expanduser(
-            "~/Library/Application Support/Code/User/workspaceStorage"
-        )
-        target_uri = f"file://{workspace_path}".rstrip("/")
-        target_db = None
+        # Step 2: find storage dirs for this folder (possibly several spellings,
+        # e.g. a symlink and its target) and compare against all other windows.
+        target_real = os.path.realpath(workspace_path)
+        mtimes = {"ours": [], "others": []}
+        for path, mtime in self.known_vscode_workspaces():
+            key = "ours" if os.path.realpath(path) == target_real else "others"
+            mtimes[key].append(mtime)
 
-        try:
-            for entry in os.scandir(ws_storage):
-                if not entry.is_dir():
-                    continue
-                wj = os.path.join(entry.path, "workspace.json")
-                if not os.path.isfile(wj):
-                    continue
-                try:
-                    with open(wj) as f:
-                        folder = json.load(f).get("folder", "").rstrip("/")
-                    if folder == target_uri:
-                        target_db = os.path.join(entry.path, "state.vscdb")
-                        break
-                except Exception:
-                    continue
-        except Exception as e:
-            logging.debug(f"Workspace scan error: {e}")
-            return False
-
-        if not target_db or not os.path.exists(target_db):
+        if not mtimes["ours"]:
             # Workspace not found in VS Code's storage — can't confirm it's active
             return False
 
-        # Step 3: is this workspace's state DB the most recently modified?
+        # Step 3: is our state DB the most recently modified?
         # The active window writes its DB most recently; background windows write less often.
-        target_mtime = os.path.getmtime(target_db)
-        try:
-            for entry in os.scandir(ws_storage):
-                if not entry.is_dir():
-                    continue
-                other_db = os.path.join(entry.path, "state.vscdb")
-                if other_db == target_db:
-                    continue
-                if os.path.isfile(other_db) and os.path.getmtime(other_db) > target_mtime:
-                    return False  # A different workspace was more recently active
-        except Exception as e:
-            logging.debug(f"Workspace mtime comparison error: {e}")
+        if mtimes["others"] and max(mtimes["others"]) > max(mtimes["ours"]):
+            return False  # A different workspace was more recently active
 
         return True
 
@@ -508,7 +480,12 @@ class ClaudePromptTracker:
         return path
 
     def known_vscode_workspaces(self):
-        """Local folders VS Code has opened, from workspaceStorage/*/workspace.json."""
+        """Local folders VS Code has opened, as (path, state_mtime) tuples.
+
+        Read from workspaceStorage/*/workspace.json. The same folder can appear
+        under several spellings (e.g. a symlink and its target); the mtime of
+        the entry's state.vscdb tells which one is the most recently active.
+        """
         from urllib.parse import unquote, urlparse
 
         ws_storage = os.path.expanduser(
@@ -521,13 +498,37 @@ class ClaudePromptTracker:
                 try:
                     with open(wj) as f:
                         uri = json.load(f).get("folder", "")
+                    mtime = os.path.getmtime(os.path.join(entry.path, "state.vscdb"))
                 except Exception:
                     continue
                 if uri.startswith("file://"):
-                    folders.append(unquote(urlparse(uri).path).rstrip("/"))
+                    folders.append((unquote(urlparse(uri).path).rstrip("/"), mtime))
         except Exception as e:
             logging.debug(f"Workspace scan error: {e}")
         return folders
+
+    def open_vscode_windows(self):
+        """Folders of currently open VS Code windows, in the order they were opened.
+
+        Read from globalStorage/storage.json (windowsState.openedWindows).
+        """
+        from urllib.parse import unquote, urlparse
+
+        path = os.path.expanduser(
+            "~/Library/Application Support/Code/User/globalStorage/storage.json"
+        )
+        try:
+            with open(path) as f:
+                windows = json.load(f).get("windowsState", {}).get("openedWindows", [])
+        except Exception as e:
+            logging.debug(f"storage.json read error: {e}")
+            return []
+        out = []
+        for w in windows:
+            uri = w.get("folder", "")
+            if uri.startswith("file://"):
+                out.append(unquote(urlparse(uri).path).rstrip("/"))
+        return out
 
     def resolve_workspace(self, cwd, transcript_path=None):
         """Resolve the VS Code workspace folder that contains cwd.
@@ -541,23 +542,44 @@ class ClaudePromptTracker:
         """
         if not cwd:
             return cwd
-        real_cwd = os.path.abspath(cwd)
+        real_cwd = os.path.realpath(cwd)
+
+        def contains(path):
+            rw = os.path.realpath(path)
+            return real_cwd == rw or real_cwd.startswith(rw + os.sep)
+
+        # Prefer folders in windows that are open right now. Among several
+        # spellings of one folder (symlink vs target), VS Code treats each as a
+        # different workspace, so we must return the spelling of the window that
+        # is already open: the earliest-opened one (a later duplicate may have
+        # been created by an earlier click-through with the wrong spelling).
+        # (path, order): lower order = opened earlier.
         candidates = [
-            w for w in self.known_vscode_workspaces()
-            if w and (real_cwd == w or real_cwd.startswith(w + os.sep))
+            (p, i) for i, p in enumerate(self.open_vscode_windows()) if contains(p)
         ]
+        if not candidates:
+            # Not open now: fall back to history, most recently active first
+            history = sorted(self.known_vscode_workspaces(), key=lambda x: -x[1])
+            candidates = [(p, i) for i, (p, _) in enumerate(history) if p and contains(p)]
         if not candidates:
             return self.find_workspace_root(cwd)
 
         if transcript_path:
             launch = os.path.basename(os.path.dirname(transcript_path))
-            anchored = []
-            for w in candidates:
-                enc = re.sub(r"[^A-Za-z0-9]", "-", w)
-                if launch == enc or launch.startswith(enc + "-"):
-                    anchored.append(w)
+            anchored = [
+                c for c in candidates
+                if any(
+                    launch == enc or launch.startswith(enc + "-")
+                    for enc in (
+                        re.sub(r"[^A-Za-z0-9]", "-", p)
+                        for p in (c[0], os.path.realpath(c[0]))
+                    )
+                )
+            ]
             candidates = anchored or candidates
-        return max(candidates, key=len)
+
+        # Deepest real folder wins; ties go to the earliest-opened spelling.
+        return max(candidates, key=lambda c: (len(os.path.realpath(c[0])), -c[1]))[0]
 
     def send_notification(self, title, subtitle, cwd=None, force=False, transcript_path=None):
         """Send a macOS notification via the configured NOTIFICATION_BACKEND.
@@ -592,6 +614,26 @@ class ClaudePromptTracker:
             self.resolve_workspace(cwd, transcript_path) if cwd else None,
         )
 
+    def vscode_open_command(self, workspace):
+        """Shell command that focuses the VS Code window showing `workspace`.
+
+        `open -a "Visual Studio Code" <path>` makes VS Code resolve symlinks, so a
+        window opened under a symlinked spelling (e.g. ~/Dropbox/... vs the real
+        ~/Library/CloudStorage/Dropbox/...) is never matched and a duplicate window
+        opens. The CLI's --folder-uri takes the URI verbatim, so it focuses exactly
+        the window opened with this spelling.
+        """
+        import shlex
+        from urllib.parse import quote
+
+        code_cli = shutil.which("code") or (
+            "/Applications/Visual Studio Code.app/Contents/Resources/app/bin/code"
+        )
+        if os.path.exists(code_cli):
+            uri = "file://" + quote(workspace)
+            return f"{shlex.quote(code_cli)} --folder-uri {shlex.quote(uri)}"
+        return f"open -a 'Visual Studio Code' {shlex.quote(workspace)}"
+
     def _send_via_terminal_notifier(self, title, subtitle, current_time, icon_path, workspace):
         """Send via terminal-notifier: fire-and-forget, with click-to-reopen-VS-Code."""
         notifier = resolve_terminal_notifier()
@@ -616,7 +658,9 @@ class ClaudePromptTracker:
                 cmd.extend(["-contentImage", icon_path])
 
             if workspace:
-                cmd.extend(["-execute", f'open -a "Visual Studio Code" "{workspace}"'])
+                open_cmd = self.vscode_open_command(workspace)
+                cmd.extend(["-execute", open_cmd])
+                logging.info(f"Click-through: {open_cmd}")
 
             result = subprocess.run(cmd, check=False, capture_output=True, text=True)
             if result.returncode != 0:
